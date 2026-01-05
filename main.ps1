@@ -5,7 +5,7 @@ param (
     [string]$AdminUsername = "sa",
     [switch]$ShowLog,
     [string]$Collation = "SQL_Latin1_General_CP1_CI_AS",
-    [ValidateSet("2022", "2019", "2017", "2016")]
+    [ValidateSet("2025", "2022", "2019", "2017", "2016")]
     [string]$Version = "2022"
 )
 if (-not $isLinux -and -not $Ismacos -and -not $IsWindows) {
@@ -37,8 +37,23 @@ if ($islinux) {
 
 if ($ismacos) {
     Write-Output "Installing sqlcmd on macOS"
-    brew update
-    brew install sqlcmd
+    # Download go-sqlcmd directly from GitHub releases to avoid Homebrew timeout issues
+    # Use arm64 for Apple Silicon (GitHub Actions macOS runners use ARM64)
+    $sqlcmdVersion = "v1.8.2"
+    $sqlcmdUrl = "https://github.com/microsoft/go-sqlcmd/releases/download/$sqlcmdVersion/sqlcmd-darwin-arm64.tar.bz2"
+
+    Write-Output "Downloading sqlcmd $sqlcmdVersion from GitHub releases..."
+    curl -L $sqlcmdUrl -o /tmp/sqlcmd.tar.bz2
+
+    Write-Output "Extracting sqlcmd..."
+    tar -xjf /tmp/sqlcmd.tar.bz2 -C /tmp
+
+    Write-Output "Installing sqlcmd to /usr/local/bin..."
+    sudo mv /tmp/sqlcmd /usr/local/bin/sqlcmd
+    sudo chmod +x /usr/local/bin/sqlcmd
+
+    Write-Output "Verifying sqlcmd installation..."
+    sqlcmd --version
 }
 
 if ($iswindows) {
@@ -74,13 +89,28 @@ if ("sqlengine" -in $Install) {
         }
 
         docker run -e "ACCEPT_EULA=Y" -e "SA_PASSWORD=$SaPassword" -e "MSSQL_COLLATION=$Collation" --name sql -p 1433:1433 -d $img
-        Write-Output "Waiting for docker to start"
+        Write-Output "Waiting for SQL Server to start..."
 
-        # MacOS takes longer to start using qemu
-        if ($ismacos) {
-            Start-Sleep -Seconds 90
-        } else {
-            Start-Sleep -Seconds 10
+        # Try to connect to SQL Server in a loop instead of fixed sleep
+        # This allows faster success or additional time if needed (especially on macOS with qemu)
+        $TryLimit = 18 # At least 3 minute maximum wait with 10 second delay between retries
+        for ($i = 1; $i -le $TryLimit; $i++) {
+            try {
+                Write-Output "Testing connection to SQL Server (Try $i of $TryLimit)"
+                $ErrorOut = sqlcmd -S localhost -U sa -P "$SaPassword" -Q "SELECT @@VERSION" -C -l 15 2>&1
+                if ($LASTEXITCODE -ne 0) {
+                    throw "sqlcmd failed with exit code $LASTEXITCODE"
+                }
+                Write-Output "Connection to SQL Server succeeded"
+                break
+            } catch {
+                if ($i -eq $TryLimit) {
+                    # We are done trying, display the suppressed error
+                    Write-Error "Timeout waiting for SQL Server to become available - $ErrorOut"
+                } else {
+                    Start-Sleep -Seconds 10
+                }
+            }
         }
 
         if ($ShowLog) {
@@ -129,6 +159,11 @@ if ("sqlengine" -in $Install) {
                 $boxUri = "https://download.microsoft.com/download/3/8/d/38de7036-2433-4207-8eae-06e247e17b25/SQLServer2022-DEV-x64-ENU.box"
                 $versionMajor = 16
             }
+            "2025" {
+                $exeUri = "https://go.microsoft.com/fwlink/?linkid=2342429&clcid=0x409&culture=en-us&country=us"
+                $boxUri = ""
+                $versionMajor = 17
+            }
         }
 
         if ("fulltext" -in $Install) {
@@ -154,7 +189,7 @@ if ("sqlengine" -in $Install) {
         Write-Warning "INSTALL ARGS: $installArgs"
 
         if ($boxUri -eq "") {
-            # For 2016 & 2017.
+            # For 2016, 2017 & 2025.
             # Download the small setup utility that allows us to download the full installation media
             Invoke-WebRequest -Uri $exeUri -OutFile c:\temp\downloadsetup.exe
             # Use the small setup utility to download the full installation media (*.box and *.exe) files to c:\temp
@@ -504,8 +539,7 @@ END
                 sqlcmd -S localhost -U $AdminUsername -P "$SaPassword" -Q "$maintenanceJobSql" -C
 
                 Write-Output "SSISDB catalog created successfully using T-SQL"
-            }
-            catch {
+            } catch {
                 $PSItem | Select-Object -Property * | Write-Warning
                 Write-Error "Failed to create SSISDB catalog with T-SQL: $_"
                 throw
@@ -521,12 +555,27 @@ if ("sqlclient" -in $Install) {
     $log = ""
 
     if ($ismacos) {
-        brew tap microsoft/mssql-release https://github.com/Microsoft/homebrew-mssql-release
-        #$null = brew update
-        brew uninstall sqlcmd
-        $log = brew install microsoft/mssql-release/msodbcsql18 microsoft/mssql-release/mssql-tools18
+        Write-Output "Installing ODBC-based mssql-tools18 on macOS"
+        Write-Output "Note: go-sqlcmd is already available from initial installation"
 
-        echo "/opt/homebrew/bin" >> $env:GITHUB_PATH
+        # Microsoft only distributes ODBC tools via Homebrew for macOS
+        # Use optimized settings to avoid timeouts
+        try {
+            Write-Output "Tapping microsoft/mssql-release..."
+            bash -c "brew tap microsoft/mssql-release https://github.com/Microsoft/homebrew-mssql-release"
+
+            Write-Output "Installing ODBC driver and tools (this may take a few minutes)..."
+            # Install without auto-update (already set via HOMEBREW_NO_AUTO_UPDATE env var)
+            bash -c "brew install --quiet microsoft/mssql-release/msodbcsql18 microsoft/mssql-release/mssql-tools18"
+
+            Write-Output "Adding mssql-tools18 to PATH..."
+            echo "/opt/mssql-tools18/bin" >> $env:GITHUB_PATH
+
+            Write-Output "mssql-tools18 installation completed"
+        } catch {
+            Write-Warning "Failed to install mssql-tools18 via Homebrew: $_"
+            Write-Warning "go-sqlcmd is still available as the sqlcmd implementation"
+        }
     }
 
     if ($islinux) {
@@ -600,6 +649,12 @@ if ("localdb" -in $Install) {
             "2019" { $uriMSI = "https://download.microsoft.com/download/7/c/1/7c14e92e-bdcb-4f89-b7cf-93543e7112d1/SqlLocalDB.msi" }
             "2022" { $uriMSI = "https://download.microsoft.com/download/3/8/d/38de7036-2433-4207-8eae-06e247e17b25/SqlLocalDB.msi" }
         }
+        # If we don't hace a uriMSI for the version, display a warning and use 2022
+        if ($null -eq $uriMSI) {
+            Write-Warning "SqlLocalDB is not available yet in this action for version $Version.  Using version 2022 instead."
+            $uriMSI = "https://download.microsoft.com/download/3/8/d/38de7036-2433-4207-8eae-06e247e17b25/SqlLocalDB.msi"
+        }
+
         Invoke-WebRequest -Uri $uriMSI -OutFile SqlLocalDB.msi
         Write-Host "Installing"
         Start-Process -FilePath "SqlLocalDB.msi" -Wait -ArgumentList "/qn", "/norestart", "/l*v SqlLocalDBInstall.log", "IACCEPTSQLLOCALDBLICENSETERMS=YES";

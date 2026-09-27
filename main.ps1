@@ -6,12 +6,42 @@ param (
     [switch]$ShowLog,
     [string]$Collation = "SQL_Latin1_General_CP1_CI_AS",
     [ValidateSet("2025", "2022", "2019", "2017", "2016")]
-    [string]$Version = "2022"
+    [string]$Version = "2022",
+    [string]$Edition = "Developer",
+    [string]$ProductKey,
+    [switch]$DisableTelemetry
 )
 if (-not $isLinux -and -not $Ismacos -and -not $IsWindows) {
     # its powershell
     $isWindows = $true
 }
+$editionNames = @("Developer", "Evaluation", "Express", "Web", "Standard", "Enterprise", "EnterpriseCore", "StandardDeveloper")
+$isProductKey = $ProductKey -match '^[A-Za-z0-9]{5}(-[A-Za-z0-9]{5}){4}$'
+if ($Edition -notin $editionNames) {
+    throw "Invalid SQL Server edition '$Edition'. Use a supported edition name."
+}
+if ($ProductKey -and -not $isProductKey) {
+    throw "The product key must contain five groups of five letters or numbers."
+}
+if ($ProductKey -and $Edition -eq "Developer") {
+    throw "Specify the paid edition together with product-key."
+}
+if ($ProductKey -and -not $IsWindows) {
+    throw "The product-key input is supported only for Windows installations."
+}
+if ($Edition -eq "StandardDeveloper" -and $Version -ne "2025") {
+    throw "StandardDeveloper is only supported with SQL Server 2025."
+}
+if ($DisableTelemetry -and $Edition -in "Developer", "Express", "StandardDeveloper") {
+    throw "Telemetry cannot be disabled for the $Edition edition of SQL Server."
+}
+if ($IsWindows -and $Edition -in "Evaluation", "Express", "StandardDeveloper" -and "sqlengine" -in $Install) {
+    throw "Windows setup currently uses Developer media and does not support the $Edition edition."
+}
+if ($IsWindows -and $Edition -ne "Developer" -and -not $ProductKey -and "sqlengine" -in $Install) {
+    throw "Windows installation of a non-Developer edition requires the product-key input."
+}
+
 # Warn if SSIS is requested on unsupported OS
 if (("ssis" -in $Install) -and ($islinux -or $ismacos)) {
     Write-Warning "The 'ssis' option is only supported on Windows. Skipping SSIS installation."
@@ -80,43 +110,7 @@ if ("sqlengine" -in $Install) {
 
     if ($ismacos -or $islinux) {
         Write-Output "linux/mac detected, downloading the docker container"
-
-        if ("fulltext" -in $Install) {
-            docker build -f $PSScriptRoot/Dockerfile-$Version -t mssql-fulltext .
-            $img = "mssql-fulltext"
-        } else {
-            $img = "mcr.microsoft.com/mssql/server:$Version-latest"
-        }
-
-        docker run -e "ACCEPT_EULA=Y" -e "SA_PASSWORD=$SaPassword" -e "MSSQL_COLLATION=$Collation" --name sql -p 1433:1433 -d $img
-        Write-Output "Waiting for SQL Server to start..."
-
-        # Try to connect to SQL Server in a loop instead of fixed sleep
-        # This allows faster success or additional time if needed (especially on macOS with qemu)
-        $TryLimit = 18 # At least 3 minute maximum wait with 10 second delay between retries
-        for ($i = 1; $i -le $TryLimit; $i++) {
-            try {
-                Write-Output "Testing connection to SQL Server (Try $i of $TryLimit)"
-                $ErrorOut = sqlcmd -S localhost -U sa -P "$SaPassword" -Q "SELECT @@VERSION" -C -l 15 2>&1
-                if ($LASTEXITCODE -ne 0) {
-                    throw "sqlcmd failed with exit code $LASTEXITCODE"
-                }
-                Write-Output "Connection to SQL Server succeeded"
-                break
-            } catch {
-                if ($i -eq $TryLimit) {
-                    # We are done trying, display the suppressed error
-                    Write-Error "Timeout waiting for SQL Server to become available - $ErrorOut"
-                } else {
-                    Start-Sleep -Seconds 10
-                }
-            }
-        }
-
-        if ($ShowLog) {
-            docker ps -a
-            docker logs -t sql
-        }
+        & "$PSScriptRoot/Start-SqlContainer.ps1" -Version $Version -SaPassword $SaPassword -Collation $Collation -FullText:("fulltext" -in $Install) -ShowLog:$ShowLog -Edition $Edition -DisableTelemetry:$DisableTelemetry
 
         # Rename sa user if custom admin username is specified
         if ($AdminUsername -ne "sa") {
@@ -140,12 +134,12 @@ if ("sqlengine" -in $Install) {
         $ProgressPreference = "SilentlyContinue"
         switch ($Version) {
             "2016" {
-                $exeUri = "https://download.microsoft.com/download/C/5/0/C50D5F5E-1ADF-43EB-BF16-205F7EAB1944/SQLServer2016-SSEI-Dev.exe"
-                $boxUri = ""
+                $exeUri = "https://download.microsoft.com/download/f/9/8/f982347c-fee3-4b3e-a8dc-c95383aa3020/sql16_sp3_dlc/en-us/SQLServer2016SP3-FullSlipstream-DEV-x64-ENU.exe"
+                $boxUri = "https://download.microsoft.com/download/f/9/8/f982347c-fee3-4b3e-a8dc-c95383aa3020/sql16_sp3_dlc/en-us/SQLServer2016SP3-FullSlipstream-DEV-x64-ENU.box"
                 $versionMajor = 13
             }
             "2017" {
-                $exeUri = "https://download.microsoft.com/download/5/A/7/5A7065A2-C81C-4A31-9972-8A31AC9388C1/SQLServer2017-SSEI-Dev.exe"
+                $exeUri = "https://go.microsoft.com/fwlink/?linkid=853016"
                 $boxUri = ""
                 $versionMajor = 14
             }
@@ -186,10 +180,12 @@ if ("sqlengine" -in $Install) {
             "/SQLCOLLATION=$Collation"
         )
 
-        Write-Warning "INSTALL ARGS: $installArgs"
+        if ($isProductKey) {
+            $installArgs += "/PID=$ProductKey"
+        }
 
         if ($boxUri -eq "") {
-            # For 2016, 2017 & 2025.
+            # For 2017 & 2025.
             # Download the small setup utility that allows us to download the full installation media
             Invoke-WebRequest -Uri $exeUri -OutFile c:\temp\downloadsetup.exe
             # Use the small setup utility to download the full installation media (*.box and *.exe) files to c:\temp
@@ -198,10 +194,11 @@ if ("sqlengine" -in $Install) {
             Get-ChildItem -Name "SQLServer*.box" | Rename-Item -NewName "sqlsetup.box"
             Get-ChildItem -Name "SQLServer*.exe" | Rename-Item -NewName "sqlsetup.exe"
         } else {
-            # For 2019 & 2022
+            # For 2016, 2019 & 2022
             Invoke-WebRequest -Uri $exeUri -OutFile sqlsetup.exe
             Invoke-WebRequest -Uri $boxUri -OutFile sqlsetup.box
-            # Add argument here as it's not supported on older versions
+        }
+        if ($versionMajor -ge 15) {
             $installArgs += "/USESQLRECOMMENDEDMEMORYLIMITS"
         }
         # Extracts media
@@ -210,6 +207,10 @@ if ("sqlengine" -in $Install) {
         # Runs SQL Server installation
         Start-Process -FilePath ".\setup\setup.exe" -ArgumentList $installArgs -Wait -NoNewWindow
 
+        if ($DisableTelemetry) {
+            # Microsoft supports opting out through CustomerFeedback, but not disabling the CEIP service.
+            Set-ItemProperty -Path "HKLM:\Software\Microsoft\Microsoft SQL Server\MSSQL$versionMajor.MSSQLSERVER\CPE" -Name CustomerFeedback -Value 0
+        }
         Set-ItemProperty -path "HKLM:\Software\Microsoft\Microsoft SQL Server\MSSQL$versionMajor.MSSQLSERVER\MSSQLSERVER\" -Name LoginMode -Value 2
         Restart-Service MSSQLSERVER
         sqlcmd -S localhost -q "ALTER LOGIN [sa] WITH PASSWORD=N'$SaPassword'" -C
